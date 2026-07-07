@@ -377,7 +377,13 @@ function collectStats(options = {}) {
 }
 
 function pythonExecutable() {
-  return process.env.PYTHON || "python";
+  if (process.env.PYTHON) return process.env.PYTHON;
+  const python = spawnSync("python", ["--version"], {
+    encoding: "utf8",
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  return python.error || python.status !== 0 ? "python3" : "python";
 }
 
 function collectCcSwitchTurns(options = {}) {
