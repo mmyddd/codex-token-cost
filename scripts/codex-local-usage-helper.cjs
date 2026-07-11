@@ -12,7 +12,11 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_DB_PATH = path.join(os.homedir(), ".codex", "codex-live-token-cost-helper.json");
 const DEFAULT_CC_SWITCH_DB_PATH = path.join(os.homedir(), ".cc-switch", "cc-switch.db");
 const SESSION_LIMIT = 80;
+const THREAD_CONTENT_SESSION_LIMIT = 12;
 const CACHE_TTL_MS = 60000;
+const CC_SWITCH_CACHE_TTL_MS = 60000;
+const CC_SWITCH_ERROR_CACHE_TTL_MS = 5000;
+const THREAD_CONTENT_CACHE_TTL_MS = 5000;
 const skillPathPatternCache = new WeakMap();
 
 function normalizeText(value, max = 120) {
@@ -106,6 +110,128 @@ function latestSessionFiles(codexHome, limit = SESSION_LIMIT) {
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
     .slice(0, limit)
     .map((item) => item.file);
+}
+
+function threadSessionFiles(codexHome, threadId, limit = THREAD_CONTENT_SESSION_LIMIT) {
+  const root = path.join(codexHome, "sessions");
+  const target = comparableThreadId(threadId).toLowerCase();
+  const files = walkFiles(root, (file) => file.endsWith(".jsonl"));
+  const named = target ? files.filter((file) => path.basename(file).toLowerCase().includes(target)) : [];
+  const source = named.length ? named : files;
+  return source
+    .map((file) => {
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(file).mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      return { file, mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit)
+    .map((item) => item.file);
+}
+
+function comparableThreadId(value) {
+  return normalizeText(value, 240).replace(/^local:/, "");
+}
+
+function collectThreadIds(value, out = new Set(), depth = 0, seen = new WeakSet()) {
+  if (!value || depth > 8) return out;
+  if (typeof value === "string") {
+    const parsed = safeJsonParse(value);
+    if (parsed && typeof parsed === "object") collectThreadIds(parsed, out, depth + 1, seen);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectThreadIds(item, out, depth + 1, seen);
+    return out;
+  }
+  if (typeof value !== "object" || seen.has(value)) return out;
+  seen.add(value);
+  for (const key of ["threadId", "thread_id", "conversationId", "conversation_id", "sessionId", "session_id"]) {
+    const id = comparableThreadId(value[key]);
+    if (id) out.add(id);
+  }
+  for (const key of ["thread", "conversation", "session"]) {
+    const id = comparableThreadId(value[key]?.id || value[key]?.threadId || value[key]?.thread_id);
+    if (id) out.add(id);
+  }
+  for (const key of ["payload", "data", "params", "turn", "thread", "conversation", "session", "request", "body", "message", "result", "response"]) {
+    if (key in value) collectThreadIds(value[key], out, depth + 1, seen);
+  }
+  return out;
+}
+
+function threadLineMatches(item, threadId) {
+  const target = comparableThreadId(threadId);
+  if (!target) return false;
+  return collectThreadIds(item).has(target);
+}
+
+function hasThreadMessageContent(item) {
+  const payload = item?.payload && typeof item.payload === "object" ? item.payload : item;
+  const type = normalizeText(payload?.type || item?.type, 80).toLowerCase();
+  const role = normalizeText(payload?.role || item?.role || payload?.author?.role, 80).toLowerCase();
+  if (type === "message" && (role === "user" || role === "assistant")) return true;
+  if (["user_message", "assistant_message", "agent_message"].includes(type)) return true;
+  return false;
+}
+
+function hasThreadUsageContent(item, depth = 0, seen = new WeakSet()) {
+  if (!item || depth > 8) return false;
+  if (typeof item === "string") {
+    const parsed = safeJsonParse(item);
+    return parsed ? hasThreadUsageContent(parsed, depth + 1, seen) : false;
+  }
+  if (Array.isArray(item)) return item.some((entry) => hasThreadUsageContent(entry, depth + 1, seen));
+  if (typeof item !== "object" || seen.has(item)) return false;
+  seen.add(item);
+  const type = normalizeText(item.type, 80).toLowerCase();
+  if (type === "token_count") return true;
+  if (item.last_token_usage || item.total_token_usage) return true;
+  const usage = item.usage || item.token_usage;
+  if (usage && typeof usage === "object" && (usage.total_tokens || usage.input_tokens || usage.output_tokens)) return true;
+  for (const key of ["payload", "data", "params", "turn", "info", "message", "result", "response"]) {
+    if (key in item && hasThreadUsageContent(item[key], depth + 1, seen)) return true;
+  }
+  return false;
+}
+
+function collectThreadContent(options = {}) {
+  const codexHome = options.codexHome || path.join(os.homedir(), ".codex");
+  const threadId = normalizeText(options.threadId || options.thread_id, 240);
+  if (!threadId) return { ok: false, source: "codex-local-usage-helper", error: "missing_thread_id" };
+  const files = threadSessionFiles(codexHome, threadId, options.threadContentSessionLimit || options.sessionLimit || THREAD_CONTENT_SESSION_LIMIT);
+  const result = {
+    ok: true,
+    source: "codex-local-usage-helper",
+    threadId,
+    exists: false,
+    hasMessages: false,
+    hasUsage: false,
+    hasContent: false,
+    lastEventAt: "",
+    scanned_session_files: files.length,
+  };
+  const target = comparableThreadId(threadId).toLowerCase();
+  for (const file of files) {
+    const fileMatchesThread = Boolean(target && path.basename(file).toLowerCase().includes(target));
+    const lines = readFileText(file).split(/\r?\n/);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const item = safeJsonParse(line);
+      if (!item || (!fileMatchesThread && !threadLineMatches(item, threadId))) continue;
+      result.exists = true;
+      const timestamp = normalizeText(item.timestamp || item.created_at || item.createdAt || item.time, 80);
+      if (timestamp && (!result.lastEventAt || timestamp > result.lastEventAt)) result.lastEventAt = timestamp;
+      if (hasThreadMessageContent(item)) result.hasMessages = true;
+      if (hasThreadUsageContent(item)) result.hasUsage = true;
+    }
+  }
+  result.hasContent = Boolean(result.hasMessages || result.hasUsage);
+  return result;
 }
 
 function invocationKey(item) {
@@ -409,13 +535,16 @@ if table_exists("usage_daily_rollups"):
     rollup_rows = cur.execute("""
     select
       date as day,
+      date || 'T12:00:00.000Z' as bucket_at,
+      'day' as time_granularity,
       coalesce(nullif(model, ''), nullif(request_model, ''), 'unknown') as model,
       coalesce(request_model, '') as request_model,
       coalesce(pricing_model, '') as pricing_model,
       sum(coalesce(request_count, success_count, 0)) as request_count,
       sum(coalesce(input_tokens, 0)) as input_tokens,
       sum(coalesce(output_tokens, 0)) as output_tokens,
-      sum(coalesce(cache_read_tokens, 0) + coalesce(cache_creation_tokens, 0)) as cached_tokens,
+      sum(coalesce(cache_read_tokens, 0)) as cached_tokens,
+      sum(coalesce(cache_creation_tokens, 0)) as cache_write_tokens,
       sum(cast(coalesce(total_cost_usd, '0') as real)) as total_cost_usd,
       0 as duration_ms
     from usage_daily_rollups
@@ -434,13 +563,16 @@ if table_exists("proxy_request_logs"):
     proxy_rows = cur.execute("""
     select
       date(created_at, 'unixepoch') as day,
+      strftime('%Y-%m-%dT%H:00:00.000Z', created_at, 'unixepoch') as bucket_at,
+      'hour' as time_granularity,
       coalesce(nullif(model, ''), nullif(request_model, ''), 'unknown') as model,
       coalesce(request_model, '') as request_model,
       coalesce(pricing_model, '') as pricing_model,
       count(*) as request_count,
       sum(coalesce(input_tokens, 0)) as input_tokens,
       sum(coalesce(output_tokens, 0)) as output_tokens,
-      sum(coalesce(cache_read_tokens, 0) + coalesce(cache_creation_tokens, 0)) as cached_tokens,
+      sum(coalesce(cache_read_tokens, 0)) as cached_tokens,
+      sum(coalesce(cache_creation_tokens, 0)) as cache_write_tokens,
       sum(cast(coalesce(total_cost_usd, '0') as real)) as total_cost_usd,
       max(coalesce(duration_ms, latency_ms, 0)) as duration_ms
     from proxy_request_logs
@@ -448,22 +580,33 @@ if table_exists("proxy_request_logs"):
       (app_type = 'codex' or data_source = 'codex_session' or provider_id = '_codex_session' or provider_type = 'codex_session')
       and coalesce(status_code, 0) between 200 and 299
       and (? is null or date(created_at, 'unixepoch') > ?)
-    group by day, model, request_model, pricing_model
-    order by day, model, request_model, pricing_model
+    group by day, bucket_at, model, request_model, pricing_model
+    order by bucket_at, model, request_model, pricing_model
     """, (rollup_max_date, rollup_max_date)).fetchall()
 
 for row in list(rollup_rows) + list(proxy_rows):
     day = row["day"] or "1970-01-01"
+    bucket_at = row["bucket_at"] or day + "T12:00:00.000Z"
+    time_granularity = row["time_granularity"] or "day"
     model = row["model"] or "unknown"
     request_model = row["request_model"] or ""
     pricing_model = row["pricing_model"] or ""
     input_tokens = int(row["input_tokens"] or 0)
     output_tokens = int(row["output_tokens"] or 0)
     cached_tokens = int(row["cached_tokens"] or 0)
+    cache_write_tokens = int(row["cache_write_tokens"] or 0)
     total = input_tokens + output_tokens
     if total <= 0:
         continue
-    key = ":".join([day, model, request_model, pricing_model])
+    key = ":".join([day if time_granularity == "day" else bucket_at, model, request_model, pricing_model])
+    usage = {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cached": cached_tokens,
+        "total": total,
+    }
+    if cache_write_tokens > 0:
+        usage["cacheWriteTokens"] = cache_write_tokens
     turns.append({
         "turnId": "cc-switch:" + key,
         "source": "cc-switch",
@@ -471,14 +614,11 @@ for row in list(rollup_rows) + list(proxy_rows):
         "model": model,
         "request_model": request_model,
         "pricing_model": pricing_model,
-        "createdAt": day + "T12:00:00.000Z",
+        "createdAt": bucket_at,
+        "timeGranularity": time_granularity,
+        "cacheWriteAvailable": cache_write_tokens > 0,
         "callCount": int(row["request_count"] or 0),
-        "usage": {
-            "input": input_tokens,
-            "output": output_tokens,
-            "cached": cached_tokens,
-            "total": total,
-        },
+        "usage": usage,
         "costUsd": float(row["total_cost_usd"] or 0),
         "durationMs": int(row["duration_ms"] or 0),
         "durationSec": int(round((row["duration_ms"] or 0) / 1000)),
@@ -525,9 +665,27 @@ con.close()
   };
 }
 
-function sendJson(res, status, body) {
+function isAllowedOrigin(origin) {
+  const text = normalizeText(origin, 300);
+  if (!text) return true;
+  if (text === "null") return false;
+  if (text === "app://-" || text.startsWith("app://-/")) return true;
+  try {
+    const url = new URL(text);
+    return (url.protocol === "http:" || url.protocol === "https:") && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+  } catch {
+    return false;
+  }
+}
+
+function corsOrigin(origin) {
+  const text = normalizeText(origin, 300);
+  return text && isAllowedOrigin(text) ? text : "*";
+}
+
+function sendJson(res, status, body, origin = "") {
   res.writeHead(status, {
-    "access-control-allow-origin": "*",
+    "access-control-allow-origin": corsOrigin(origin),
     "access-control-allow-methods": "GET, OPTIONS",
     "access-control-allow-headers": "content-type",
     "access-control-allow-private-network": "true",
@@ -544,6 +702,10 @@ function startServer(options = {}) {
   let cached = readDb(dbPath);
   let cachedAt = cached?.updated_at ? Date.parse(cached.updated_at) : 0;
   let refreshing = false;
+  let ccSwitchCached = null;
+  let ccSwitchCachedAt = 0;
+  let ccSwitchRefreshing = false;
+  const threadContentCache = new Map();
   const refresh = () => {
     if (refreshing) return;
     refreshing = true;
@@ -558,34 +720,89 @@ function startServer(options = {}) {
       refreshing = false;
     });
   };
+  const refreshCcSwitch = () => {
+    if (ccSwitchRefreshing) return;
+    ccSwitchRefreshing = true;
+    if (typeof options.onCcSwitchRefresh === "function") options.onCcSwitchRefresh();
+    setTimeout(() => {
+      try {
+        ccSwitchCached = collectCcSwitchTurns(options);
+        ccSwitchCachedAt = Date.now();
+      } catch (error) {
+        ccSwitchCached = {
+          ok: false,
+          source: "cc-switch",
+          db_path: options.ccSwitchDbPath || DEFAULT_CC_SWITCH_DB_PATH,
+          turns: [],
+          imported: 0,
+          skipped: 0,
+          error: normalizeText(error?.message || String(error), 500),
+          updated_at: new Date().toISOString(),
+        };
+        ccSwitchCachedAt = Date.now();
+      } finally {
+        ccSwitchRefreshing = false;
+      }
+    }, Number(options.ccSwitchRefreshDelayMs || 0));
+  };
   if (!cached?.ok) refresh();
   const server = http.createServer((req, res) => {
-    if (req.method === "OPTIONS") {
-      sendJson(res, 204, {});
+    const origin = req.headers.origin || "";
+    const url = new URL(req.url || "/", `http://${host}:${port}`);
+    const protectedPath = url.pathname === "/stats" || url.pathname === "/cc-switch/turns" || url.pathname === "/codex/thread-content";
+    if (protectedPath && !isAllowedOrigin(origin)) {
+      sendJson(res, 403, { ok: false, error: "forbidden_origin" }, origin);
       return;
     }
-    const url = new URL(req.url || "/", `http://${host}:${port}`);
+    if (req.method === "OPTIONS") {
+      sendJson(res, 204, {}, origin);
+      return;
+    }
     if (url.pathname === "/health") {
-      sendJson(res, 200, { ok: true, source: "codex-local-usage-helper" });
+      sendJson(res, 200, { ok: true, source: "codex-local-usage-helper" }, origin);
       return;
     }
     if (url.pathname === "/stats") {
       const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
       if (forceRefresh) {
         refresh();
-        sendJson(res, cached?.ok ? 200 : 202, { ...(cached?.ok ? cached : { ok: false, source: "codex-local-usage-helper" }), refreshing });
+        sendJson(res, cached?.ok ? 200 : 202, { ...(cached?.ok ? cached : { ok: false, source: "codex-local-usage-helper" }), refreshing }, origin);
         return;
       }
       const stale = !cached?.ok || Date.now() - cachedAt > CACHE_TTL_MS;
       if (stale) refresh();
-      sendJson(res, cached?.ok ? 200 : 202, { ...(cached?.ok ? cached : { ok: false, source: "codex-local-usage-helper" }), refreshing });
+      sendJson(res, cached?.ok ? 200 : 202, { ...(cached?.ok ? cached : { ok: false, source: "codex-local-usage-helper" }), refreshing }, origin);
       return;
     }
     if (url.pathname === "/cc-switch/turns") {
-      sendJson(res, 200, collectCcSwitchTurns(options));
+      const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+      const cacheTtl = ccSwitchCached?.ok && !ccSwitchCached?.error ? CC_SWITCH_CACHE_TTL_MS : CC_SWITCH_ERROR_CACHE_TTL_MS;
+      const stale = !ccSwitchCached || !ccSwitchCachedAt || Date.now() - ccSwitchCachedAt > cacheTtl;
+      if (forceRefresh || stale) refreshCcSwitch();
+      const payload = ccSwitchCached || {
+        ok: true,
+        source: "cc-switch",
+        db_path: options.ccSwitchDbPath || DEFAULT_CC_SWITCH_DB_PATH,
+        turns: [],
+        imported: 0,
+        skipped: 0,
+      };
+      sendJson(res, ccSwitchCached?.ok ? 200 : 202, { ...payload, refreshing: ccSwitchRefreshing }, origin);
       return;
     }
-    sendJson(res, 404, { ok: false, error: "not_found" });
+    if (url.pathname === "/codex/thread-content") {
+      const threadId = url.searchParams.get("threadId") || url.searchParams.get("thread_id") || "";
+      const cacheKey = comparableThreadId(threadId);
+      const cachedThread = cacheKey ? threadContentCache.get(cacheKey) : null;
+      const payload =
+        cachedThread && Date.now() - cachedThread.cachedAt < THREAD_CONTENT_CACHE_TTL_MS
+          ? cachedThread.payload
+          : collectThreadContent({ ...options, threadId });
+      if (cacheKey && payload.ok) threadContentCache.set(cacheKey, { payload, cachedAt: Date.now() });
+      sendJson(res, payload.ok ? 200 : 400, payload, origin);
+      return;
+    }
+    sendJson(res, 404, { ok: false, error: "not_found" }, origin);
   });
   server.listen(port, host, () => {
     console.log(`codex-local-usage-helper listening on http://${host}:${port}`);
@@ -617,6 +834,7 @@ module.exports = {
   readInstalledPlugins,
   readInstalledSkills,
   latestSessionFiles,
+  collectThreadContent,
   detectSkillFromText,
   detectPluginFromToolName,
   collectCcSwitchTurns,
