@@ -222,6 +222,7 @@
     started: false,
     startedAt: Date.now(),
     renderTimer: 0,
+    outputRateTimer: 0,
     lastRenderAt: 0,
     mainEditable: null,
     mainEditableAt: 0,
@@ -1600,7 +1601,9 @@
   }
 
   function syncActiveLocalCurrentTurn() {
+    const previous = state.localCurrentTurn;
     state.localCurrentTurn = localCurrentTurn(currentSessionKey());
+    if (previous !== state.localCurrentTurn) cancelOutputRateRefresh();
     return state.localCurrentTurn;
   }
 
@@ -3079,6 +3082,24 @@
     if (isActiveLocalStateSession(key)) state.localTurnTimer = 0;
   }
 
+  function cancelOutputRateRefresh() {
+    if (!state.outputRateTimer) return;
+    window.clearTimeout?.(state.outputRateTimer);
+    state.outputRateTimer = 0;
+  }
+
+  function syncOutputRateRefresh(rate) {
+    if (!rate?.active) {
+      cancelOutputRateRefresh();
+      return;
+    }
+    if (state.outputRateTimer) return;
+    state.outputRateTimer = window.setTimeout(() => {
+      state.outputRateTimer = 0;
+      scheduleRender(0);
+    }, RENDER_THROTTLE_MS);
+  }
+
   function turnShimmerState(sessionKey = currentSessionKey()) {
     const key = localStateSessionKey(sessionKey);
     return state.turnShimmerSessions.get(key) || { running: false, startedAt: 0, outputStartedAt: 0 };
@@ -3107,6 +3128,7 @@
     const sessionKey = localStateSessionKey(options.sessionKey || currentSessionKey());
     const item = turnShimmerState(sessionKey);
     if (item.running) return false;
+    if (isActiveLocalStateSession(sessionKey)) cancelOutputRateRefresh();
     setTurnShimmerState(sessionKey, { running: true, startedAt: Date.now(), outputStartedAt: 0 });
     scheduleRender(0);
     return true;
@@ -3116,6 +3138,7 @@
     const sessionKey = localStateSessionKey(options.sessionKey || currentSessionKey());
     const item = turnShimmerState(sessionKey);
     if (!item.running) return false;
+    if (isActiveLocalStateSession(sessionKey)) cancelOutputRateRefresh();
     setTurnShimmerState(sessionKey, { ...item, running: false, outputStartedAt: Date.now() });
     if (isActiveLocalStateSession(sessionKey)) stopCadencedShimmer({ finishActive: options.finishActive !== false });
     scheduleRender(0);
@@ -3296,6 +3319,30 @@
     };
   }
 
+  function outputTokenRate(turn, running, now = Date.now()) {
+    if (!running || !turn) return { active: false, visible: false, value: 0 };
+    const output = toCount(turn.usage ? normalizeUsage(turn.usage).output : aggregateTurnUsage(turn).output);
+    const outputStartedAt = Number(turn.outputStartedAt);
+    const elapsedMs = Math.max(0, toTimestampMs(now) - outputStartedAt);
+    if (!output || !Number.isFinite(outputStartedAt) || outputStartedAt <= 0) return { active: false, visible: false, value: 0 };
+    if (!elapsedMs) return { active: true, visible: false, value: 0 };
+    return { active: true, visible: true, value: Math.max(1, Math.round((output * 1000) / elapsedMs)) };
+  }
+
+  function averageOutputTokenRate(turn, running) {
+    if (running || !turn) return { visible: false, value: 0 };
+    const usage = normalizeUsage(turn.usage);
+    if (!usage.exact) return { visible: false, value: 0 };
+    const durationMs = normalizedDurationMs(turn, toTimestampMs(turn.startedAt), toTimestampMs(turn.finishedAt));
+    if (!durationMs) return { visible: true, value: 0 };
+    return { visible: true, value: Math.max(0, (usage.output * 1000) / durationMs) };
+  }
+
+  function fmtAverageOutputTokenRate(value) {
+    const rate = Number(value);
+    return Number.isFinite(rate) && rate > 0 ? rate.toFixed(2) : "0";
+  }
+
   function persistLocalCurrentTurn(reason = "persist", sessionKey = currentSessionKey()) {
     const key = localStateSessionKey(sessionKey);
     if (isTransientSessionKey(key)) return false;
@@ -3341,6 +3388,7 @@
     } else {
       turn.calls.push({ usage, source, observedAt: now });
     }
+    if (!(Number(turn.outputStartedAt) > 0) && toCount(aggregateTurnUsage(turn).output)) turn.outputStartedAt = now;
     const metric = localTurnMetric(turn, now);
     if (!metric) return false;
     scheduleProfileUsageRefresh();
@@ -3407,6 +3455,13 @@
       }
       stopTurnShimmer({ finishActive: true, sessionKey: taskCompleteSessionKey });
     } else if (taskCompletePayload && genericTaskCompleteWithoutSession) {
+      clearLocalTurnTimer(sessionKey);
+      const currentTurn = localCurrentTurn(sessionKey);
+      if (currentTurn) {
+        applyOfficialTurnTiming(currentTurn, payload);
+        persistLocalCurrentTurn("complete", sessionKey);
+        setLocalCurrentTurn(null, sessionKey);
+      }
       stopTurnShimmer({ finishActive: true, sessionKey });
     } else if (changed && !persistUsage && tokenCountPayload) persistLocalCurrentTurn("live", sessionKey);
     else if (changed && !persistUsage) scheduleLocalTurnCompletionCheck(0, { sessionKey });
@@ -3431,6 +3486,7 @@
             sessionKey: current.sessionKey,
             threadKey: current.threadKey || current.sessionKey,
             startedAt: current.startedAt,
+            outputStartedAt: current.outputStartedAt,
             callCount: current.calls.length,
             durationMs: currentDurationMs,
             usage: aggregateTurnUsage(current),
@@ -4087,7 +4143,9 @@
     const dayCost = todayCost();
     const dayUsage = todayUsage();
     const fastMode = state.detectedFastMode === true;
-    return { current, session: displaySession, turns: turns.length, sessionKey, model, modelInfo, price, sessionCost, dayCost, dayUsage, confidence, running, fastMode };
+    const rate = outputTokenRate(currentTurn, running);
+    const averageRate = averageOutputTokenRate(lastTurn, running);
+    return { current, session: displaySession, turns: turns.length, sessionKey, model, modelInfo, price, sessionCost, dayCost, dayUsage, confidence, running, fastMode, rate, averageRate };
   }
 
   function emptyDailyUsageBucket(date = "") {
@@ -5268,7 +5326,7 @@
         color-scheme: light dark;
         position: relative;
         display: grid;
-        grid-template-columns: minmax(0, 1.55fr) minmax(0, .70fr) minmax(0, 1fr) minmax(0, .82fr) minmax(0, .82fr) minmax(0, 1.51fr);
+        grid-template-columns: minmax(0, 2.05fr) minmax(0, .62fr) minmax(0, .88fr) minmax(0, .76fr) minmax(0, .76fr) minmax(0, 1.20fr);
         align-items: center;
         gap: 0;
         width: min(100%, 760px);
@@ -5323,6 +5381,14 @@
         display: inline-flex;
         align-items: center;
         gap: 3px;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #${ROOT_ID} .cltc-output-rate[hidden] {
+        display: none;
       }
       #${ROOT_ID} .cltc-model-label {
         display: inline-flex;
@@ -7850,7 +7916,7 @@
   }
 
   function currentFlowSkeleton() {
-    return `本轮 输入 ${valueSlot("current-input")}<span class="cltc-current-spacer" aria-hidden="true">&nbsp;&nbsp;</span>输出 ${valueSlot("current-output")}`;
+    return `本轮 输入 ${valueSlot("current-input")}<span class="cltc-current-spacer" aria-hidden="true">&nbsp;&nbsp;</span>输出 ${valueSlot("current-output")}<span class="cltc-output-rate" data-cltc-output-rate="live" hidden> · ${valueSlot("current-output-rate")} token/s</span><span class="cltc-output-rate" data-cltc-output-rate="average" hidden> · ${valueSlot("current-average-output-rate")} token/s</span>`;
   }
 
   function hubSkeletonHtml() {
@@ -7866,7 +7932,11 @@
   }
 
   function ensureHubSkeleton(root) {
-    if (root.dataset.cltcSkeletonVersion === VERSION && root.querySelector?.("[data-cltc-value-key='current-input']")) return;
+    if (
+      root.dataset.cltcSkeletonVersion === VERSION &&
+      root.querySelector?.("[data-cltc-value-key='current-input']") &&
+      root.querySelector?.("[data-cltc-output-rate='average']")
+    ) return;
     root.innerHTML = hubSkeletonHtml();
     root.dataset.cltcSkeletonVersion = VERSION;
   }
@@ -7889,6 +7959,8 @@
   function updateHubContent(root, snap, sessionPricedLabel, dayPricedLabel) {
     updateValueSlot(root, "current-input", fmtCount(snap.current.input));
     updateValueSlot(root, "current-output", fmtCount(snap.current.output));
+    updateValueSlot(root, "current-output-rate", fmtCount(snap.rate.value));
+    updateValueSlot(root, "current-average-output-rate", fmtAverageOutputTokenRate(snap.averageRate.value));
     updateValueSlot(root, "session-total", fmtCount(snap.session.total));
     updateValueSlot(root, "session-cached", fmtCount(snap.session.cached));
     updateValueSlot(root, "session-cache-percent", fmtPercent(snap.session.cached, snap.session.input));
@@ -7908,6 +7980,12 @@
       if (snap.fastMode) fastIcon.removeAttribute?.("hidden");
       else fastIcon.setAttribute?.("hidden", "");
     }
+    root.querySelectorAll?.("[data-cltc-output-rate='live']").forEach((node) => {
+      node.hidden = !snap.rate.visible;
+    });
+    root.querySelectorAll?.("[data-cltc-output-rate='average']").forEach((node) => {
+      node.hidden = !snap.averageRate.visible;
+    });
   }
 
   function render(force = false) {
@@ -7926,6 +8004,7 @@
     ensureHubSkeleton(root);
     updateHubContent(root, snap, sessionPricedLabel, dayPricedLabel);
       syncCadencedShimmer(snap.running);
+      syncOutputRateRefresh(snap.rate);
       syncHubVisibility(root);
       if (!state.settingsOverlay?.isConnected || !state.priceEditorOpen) renderSettingsOverlay(snap);
     }
@@ -8338,6 +8417,7 @@
   function destroy() {
     state.started = false;
     if (state.renderTimer) window.clearTimeout(state.renderTimer);
+    cancelOutputRateRefresh();
     if (state.profileSaveStatusTimer) window.clearTimeout(state.profileSaveStatusTimer);
     if (state.settingsOverlayCloseTimer) window.clearTimeout(state.settingsOverlayCloseTimer);
     if (state.settingsStatusPulseFrame && typeof window.cancelAnimationFrame === "function") {
@@ -8470,6 +8550,9 @@
       costForModelUsage,
       addUsage,
       aggregateTurnUsage,
+      outputTokenRate,
+      averageOutputTokenRate,
+      fmtAverageOutputTokenRate,
       usageHasCostData,
       costPricedLabel,
       shouldPersistUsagePayload,
@@ -8553,6 +8636,9 @@
       rememberPendingInput,
       startTurnShimmer,
       stopTurnShimmer,
+      syncOutputRateRefresh,
+      cancelOutputRateRefresh,
+      currentFlowSkeleton,
       updateValueSlot,
       rememberLocalUsage,
       persistLocalCurrentTurn,
